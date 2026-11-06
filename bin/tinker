@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# tinker — the one command. Subcommands:
+#   tinker start <slug>          new slug → talk it through with Claude (birth), then loop in background
+#                                existing  → (re)start its loop in the background. Safe any time.
+#   tinker status [slug] [lines] all projects, or one project's state + recent loop lines
+#   tinker log <slug> [lines]    follow a project's loop log live (Ctrl-C stops watching, not the loop)
+#   tinker stop <slug>           graceful stop after the current step
+#   tinker doctor                check that everything needed is installed and reachable
+#   tinker run submit|status|log ...   run an experiment command via the configured runner
+# Env: MAX_SESSIONS (default 40) · TINKER_MODEL (Claude model; default = Claude Code's default)
+set -euo pipefail
+_s=${BASH_SOURCE[0]}   # resolve symlinks (e.g. ~/.local/bin/tinker) to find the repo
+while [ -L "$_s" ]; do _t=$(readlink "$_s"); case "$_t" in /*) _s=$_t ;; *) _s=$(dirname "$_s")/$_t ;; esac; done
+TL_SELF=$_s
+# shellcheck source=bin/_common.sh
+. "$(cd "$(dirname "$_s")" && pwd -P)/../bin/_common.sh"
+
+usage() {
+  sed -n '2,10p' "$TINKER_HOME/bin/tinker" | sed 's/^# \{0,1\}//'
+}
+
+list_projects() {
+  local d
+  for d in "$PROJECTS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done
+}
+
+need_project() {  # need_project <cmd> <slug>
+  [ -n "${2:-}" ] || { echo "usage: tinker $1 <project>" >&2; echo "projects: $(list_projects | tr '\n' ' ')" >&2; exit 2; }
+  tl_valid_slug "$2" || { echo "tinker $1: '$2' is not a valid project name (use lowercase letters, digits, dashes)" >&2; exit 2; }
+  [ -d "$PROJECTS_DIR/$2" ] || { echo "tinker $1: no such project: $2" >&2; echo "projects: $(list_projects | tr '\n' ' ')" >&2; exit 2; }
+}
+
+# ---------------------------------------------------------------------------------------------
+cmd_start() {
+  local P=${1:-}
+  [ -n "$P" ] || { echo "usage: tinker start <project>   (lowercase-with-dashes name)" >&2; exit 2; }
+  tl_valid_slug "$P" || { echo "tinker start: '$P' is not a valid name. Use lowercase letters, digits and dashes, e.g. my-first-idea" >&2; exit 2; }
+  shift
+  local PDIR=$PROJECTS_DIR/$P
+  mkdir -p "$PROJECTS_DIR"
+
+  if [ ! -d "$PDIR" ]; then
+    command -v claude >/dev/null 2>&1 || tl_die "Claude Code ('claude') is not on your PATH. Install it, then run 'tinker doctor'."
+    echo "tinker: no project '$P' yet. Opening Claude so you can talk the idea through."
+    echo "  Claude will ask you questions, then create projects/$P/ and exit."
+    echo "  The loop starts by itself when you're done. (Exit without creating files to cancel.)"
+    cd "$TINKER_HOME"
+    # The birth brief is the newborn session's ENTIRE instruction set. It isolates the session to the
+    # slug alone (no other project bleeds in) and maps the downstream machine so SEED/README are
+    # usable fuel. Gitignored (.birth.*.md); removed after the session, also on Ctrl-C.
+    local BRIEF="$TINKER_HOME/.birth.$P.md"
+    trap 'rm -f "$BRIEF"; echo "tinker: birth cancelled — removed the temporary brief" >&2' EXIT
+    sed "s/__SLUG__/$P/g" > "$BRIEF" <<'BIRTH_EOF'
+# BIRTH BRIEF — project slug: __SLUG__   (temporary; ignore + delete after this session)
+
+Your ONLY seed is the slug "__SLUG__". This session does PROJECT BIRTH and nothing else.
+
+## Isolation (this OVERRIDES CLAUDE.md for this session)
+- Do NOT read PROJECTS.md, any projects/<other>/, examples/, or any other project's files. They
+  would contaminate this topic's framing. The catch-up rule in CLAUDE.md does NOT apply at birth —
+  there is nothing yet to catch up on. The slug + this conversation are all you get.
+
+## Your job: probe until aligned
+Ask focused questions, a few at a time, in plain language, until you and the user agree on:
+  1. the topic (one line), and
+  2. the-assumption-to-attack — the load-bearing thing people in this area rarely question.
+     This is the most important output; a weak assumption -> weak angles. Do NOT fill files
+     until this is sharp.
+The user may not be an expert or a researcher. Help them get there; offer candidate assumptions
+for them to react to.
+
+## Why it matters — the downstream machine you are fueling
+After you exit, autonomous loop sessions each run ONE move from loop/PROTOCOL.md on
+projects/__SLUG__/, COLD, with no context but that folder:
+  GATHER  — collect the field's known recipe (recipe-baseline), cited.
+  IDEATE  — attack the assumption -> 1-3 angles, each beating a baseline axis or sidestepping a
+            bottleneck (an angle whose load-bearing move traces to a citation is rejected as a summary).
+  PROBE   — turn an angle into cheaply-answerable feasibility questions; reading is offloaded to
+            local models (fleet/gather.sh, fleet/draft.sh) or subagents; verdict = pursue / needs-test / kill.
+  DOSSIER — a survivor earns a writeup + bin/gate.sh -> the user's go/no-go.
+So write SEED's the-assumption-to-attack, constraints (the evidence-surfaces: sources, datasets,
+repos, prototypes, budget, hardware if relevant — whatever the cheap-truth sources are for THIS
+topic) and novelty-bar so a COLD session can act on them alone.
+
+## When aligned
+Copy templates/project/ -> projects/__SLUG__/ (e.g. `cp -R templates/project projects/__SLUG__`),
+fill SEED.md, README.md, STATE.md and the angles.md header for this topic, add a row to
+PROJECTS.md, then STOP and tell the user they can exit. Do not run the loop yourself — tinker
+starts it after you exit. Leave recipe-baseline as the "to be gathered" placeholder unless the
+user handed you cited sources; never invent evidence.
+BIRTH_EOF
+    local rc=0
+    if [ -n "${TINKER_MODEL:-}" ]; then
+      claude --model "$TINKER_MODEL" "PROJECT BIRTH for slug '$P'. Your COMPLETE brief is the file ./.birth.$P.md in this directory — read it FIRST and follow it exactly. It overrides the catch-up rule in CLAUDE.md for this session: do not read PROJECTS.md or any other project's files; the slug is your only seed." || rc=$?
+    else
+      claude "PROJECT BIRTH for slug '$P'. Your COMPLETE brief is the file ./.birth.$P.md in this directory — read it FIRST and follow it exactly. It overrides the catch-up rule in CLAUDE.md for this session: do not read PROJECTS.md or any other project's files; the slug is your only seed." || rc=$?
+    fi
+    rm -f "$BRIEF"; trap - EXIT
+    if [ ! -f "$PDIR/SEED.md" ]; then
+      echo "tinker: project '$P' was not created (claude exit=$rc). Nothing started."; exit 0
+    fi
+    echo "tinker: project '$P' created. Starting its loop in the background."
+  fi
+
+  mkdir -p "$PDIR/logs" "$PDIR/state"
+  local PIDF=$PDIR/state/loop.pid pid
+  if pid=$(tl_pid_alive "$PIDF"); then
+    echo "tinker: $P is already running (pid $pid).  watch: tinker log $P  ·  stop: tinker stop $P"; exit 0
+  fi
+  rm -f "$PIDF"   # stale pidfile (process gone)
+  # Fallback guard: a loop running without a live pidfile. Match the loop script with the slug as
+  # an exact argument (so 'edit' can't match 'image-edit').
+  local legacy
+  # shellcheck disable=SC2009  # pgrep -a is not portable to macOS
+  legacy=$(ps -eo pid=,args= 2>/dev/null | grep -E "bin/tinker-loop[[:space:]]+${P}([[:space:]]|\$)" | grep -v grep || true)
+  if [ -n "$legacy" ]; then
+    echo "tinker: a loop for $P is already running (not tracked by its pidfile):"; echo "  $legacy"
+    echo "  stop it first (kill $(echo "$legacy" | awk '{print $1}')), then run tinker start $P again."; exit 3
+  fi
+
+  rm -f "$PDIR/state/STOP"
+  # fully detached: own session where possible, stdin from /dev/null, output → runner.log
+  tl_detach "$TINKER_HOME/bin/tinker-loop" "$P" "$@" >>"$PDIR/logs/runner.log" 2>&1 </dev/null
+  echo $! > "$PIDF"
+  echo "tinker: $P started in the background (pid $!). You can close this terminal."
+  echo "  watch: tinker log $P   ·   status: tinker status $P   ·   stop: tinker stop $P"
+}
+
+# ---------------------------------------------------------------------------------------------
+cmd_status() {
+  local P=${1:-} pid
+  if [ -z "$P" ]; then
+    local any=0 d state gates
+    for d in "$PROJECTS_DIR"/*/; do
+      [ -d "$d" ] || continue
+      any=1; d=${d%/}
+      if pid=$(tl_pid_alive "$d/state/loop.pid"); then
+        if [ -e "$d/state/IDLE" ]; then state="running (idle, waiting)"; else state="running"; fi
+      elif [ -e "$d/state/IDLE" ]; then state="stopped (idle)"
+      else state="stopped"; fi
+      gates=$(tl_pending_gates "$d")
+      if [ "$gates" -gt 0 ]; then state="$state · $gates gate(s) waiting for you"; fi
+      printf '  %-28s %s\n' "$(basename "$d")" "$state"
+    done
+    [ "$any" = 1 ] || echo "No projects yet. Start one with: tinker start <name>"
+    return 0
+  fi
+  need_project status "$P"
+  local PDIR=$PROJECTS_DIR/$P
+  if pid=$(tl_pid_alive "$PDIR/state/loop.pid"); then
+    if [ -e "$PDIR/state/IDLE" ]; then
+      echo "$P: RUNNING (pid $pid), idle — $(head -1 "$PDIR/state/IDLE" 2>/dev/null)"
+    else
+      echo "$P: RUNNING (pid $pid)"
+    fi
+  elif [ -e "$PDIR/state/IDLE" ]; then
+    echo "$P: not running — last state IDLE: $(head -1 "$PDIR/state/IDLE" 2>/dev/null)"
+  else
+    echo "$P: not running"
+  fi
+  local n; n=$(tl_pending_gates "$PDIR")
+  if [ "$n" -gt 0 ]; then
+    echo "  $n gate(s) waiting for you → $PDIR/gates/INDEX.md"
+  fi
+  if [ -f "$PDIR/STATE.md" ]; then
+    local next
+    next=$(awk '/^## Next move/{f=1;next} /^## /{f=0} f && /^- /{print; exit}' "$PDIR/STATE.md")
+    [ -n "$next" ] && echo "  next move: ${next#- }"
+  fi
+  echo "--- last loop lines ---"
+  tail -n "${2:-15}" "$PDIR/logs/runner.log" 2>/dev/null || echo "(no runner.log yet)"
+}
+
+# ---------------------------------------------------------------------------------------------
+cmd_log() {
+  need_project log "${1:-}"
+  local P=$1 LOG=$PROJECTS_DIR/$1/logs/runner.log
+  [ -f "$LOG" ] || { echo "tinker log: no log yet at $LOG. Has 'tinker start $P' run?" >&2; exit 1; }
+  echo "[tinker log] $LOG  (per-step detail: $PROJECTS_DIR/$P/logs/session-*.log)  Ctrl-C stops watching."
+  exec tail -n "${2:-40}" -F "$LOG"
+}
+
+# ---------------------------------------------------------------------------------------------
+cmd_stop() {
+  need_project stop "${1:-}"
+  local P=$1 PDIR=$PROJECTS_DIR/$1 pid
+  mkdir -p "$PDIR/state"
+  touch "$PDIR/state/STOP"
+  echo "tinker: stop requested for $P — the loop exits after the current step. Nothing is lost."
+  if pid=$(tl_pid_alive "$PDIR/state/loop.pid"); then
+    echo "  loop pid $pid may be mid-step (a step can be a long Claude session)."
+    echo "  to stop immediately instead (safe; state is in files): kill $pid"
+  else
+    echo "  (no loop is running right now.)"
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------
+cmd_doctor() { exec "$TINKER_HOME/bin/tinker-doctor" "$@"; }
+cmd_run() { exec "$TINKER_HOME/bin/tinker-run" "$@"; }
+
+sub=${1:-help}; [ $# -gt 0 ] && shift
+case "$sub" in
+  start)  cmd_start "$@" ;;
+  status) cmd_status "$@" ;;
+  log)    cmd_log "$@" ;;
+  stop)   cmd_stop "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  run)    cmd_run "$@" ;;
+  help|-h|--help) usage ;;
+  *) echo "tinker: unknown command '$sub'" >&2; usage >&2; exit 2 ;;
+esac

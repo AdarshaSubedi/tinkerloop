@@ -1,0 +1,21 @@
+# your settings (copy config.example.json → config.json)
+config.json
+
+# your projects stay local — only the placeholder is tracked
+projects/*
+!projects/.gitkeep
+
+# loop runtime anywhere (examples copied into projects/ are covered above)
+state/
+logs/
+*.log
+examples/*/state/
+examples/*/logs/
+examples/*/jobs/
+examples/*/gates/*.html
+
+# transient project-birth brief (written by `tinker start`, removed after the birth session)
+.birth.*.md
+
+# your own Claude Code permission additions (see README "Safety")
+.claude/settings.local.json

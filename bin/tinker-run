@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# tinker-run — run experiment commands through the configured runner. The loop, PROTOCOL and the
+# experiment template call ONLY this; it dispatches on config.json's "runner" (or $TINKER_RUNNER).
+#
+#   tinker-run submit [--project P] [--name tag] [--vram GB] [--class tag] [--cwd dir] --cmd '<command>'
+#        → prints the JOB_ID on stdout (one line). Record it in STATE as job=<JOB_ID>.
+#   tinker-run status <JOB_ID>   → exit 0 done · 1 failed · 2 running · 3 pending · 4 missing
+#                                  (also prints one word: done|failed|running|pending|missing)
+#   tinker-run log <JOB_ID>      → prints the job's log (if the runner keeps one)
+#
+# Runners (runners/<name>.sh): direct (default — runs here, in the background) · gpu-queue (adapter
+# for a shared submit/status queue; see runners/gpu-queue.sh).
+set -euo pipefail
+_s=${BASH_SOURCE[0]}
+while [ -L "$_s" ]; do _t=$(readlink "$_s"); case "$_t" in /*) _s=$_t ;; *) _s=$(dirname "$_s")/$_t ;; esac; done
+TL_SELF=$_s
+# shellcheck source=bin/_common.sh
+. "$(cd "$(dirname "$_s")" && pwd -P)/../bin/_common.sh"
+
+RUNNER=${TINKER_RUNNER:-$(tl_config '.runner')}
+RUNNER=${RUNNER:-direct}
+case "$RUNNER" in
+  *[!a-z0-9-]*|'') echo "tinker-run: invalid runner name '$RUNNER'" >&2; exit 64 ;;
+esac
+IMPL=$TINKER_HOME/runners/$RUNNER.sh
+[ -x "$IMPL" ] || { echo "tinker-run: unknown runner '$RUNNER' (no $IMPL). Use 'direct' or 'gpu-queue'." >&2; exit 64; }
+
+case "${1:-}" in
+  submit|status|log) exec "$IMPL" "$@" ;;
+  which) echo "$RUNNER" ;;
+  *) sed -n '2,12p' "$TINKER_HOME/bin/tinker-run" | sed 's/^# \{0,1\}//' >&2; exit 64 ;;
+esac

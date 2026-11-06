@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# tinker-doctor — run via `tinker doctor`. Checks what tinkerloop needs, in plain words.
+# PASS = fine · WARN = optional thing missing or unreachable (it still works) · FAIL = must fix.
+# Exits non-zero only when a hard requirement is missing.
+set -euo pipefail
+_s=${BASH_SOURCE[0]}
+while [ -L "$_s" ]; do _t=$(readlink "$_s"); case "$_t" in /*) _s=$_t ;; *) _s=$(dirname "$_s")/$_t ;; esac; done
+TL_SELF=$_s
+# shellcheck source=bin/_common.sh
+. "$(cd "$(dirname "$_s")" && pwd -P)/../bin/_common.sh"
+
+fails=0; warns=0
+pass() { printf 'PASS  %s\n' "$*"; }
+warn() { printf 'WARN  %s\n' "$*"; warns=$((warns+1)); }
+fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails+1)); }
+
+echo "tinkerloop doctor — home: $TINKER_HOME"
+echo
+
+# --- hard requirements -----------------------------------------------------------------------
+pass "bash ${BASH_VERSION%%(*}"
+for tool in git jq curl; do
+  if command -v "$tool" >/dev/null 2>&1; then pass "$tool found"; else fail "$tool is not installed (needed). Install it with your package manager."; fi
+done
+if command -v claude >/dev/null 2>&1; then
+  v=$(claude --version 2>/dev/null | head -1 || true)
+  pass "Claude Code found${v:+ ($v)}"
+else
+  fail "Claude Code ('claude') is not on your PATH. Install it from https://claude.com/claude-code"
+fi
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  pass "timeout command found (caps each step's length)"
+else
+  warn "no 'timeout' command — steps run without a time cap. On macOS: brew install coreutils"
+fi
+
+# --- tinker on PATH --------------------------------------------------------------------------
+if command -v tinker >/dev/null 2>&1; then pass "'tinker' is on your PATH"
+else warn "'tinker' is not on your PATH yet — run ./install.sh (or call $TINKER_HOME/bin/tinker)"; fi
+
+# --- config + local models -------------------------------------------------------------------
+echo
+if [ ! -f "$TINKER_CONFIG" ]; then
+  pass "no config.json — Claude-only mode (Claude does all the reading itself; works, costs more usage)"
+  runner=direct
+elif ! command -v jq >/dev/null 2>&1; then
+  warn "config.json found but jq is missing, so it can't be checked"
+  runner=direct
+elif ! jq -e 'type == "object"' "$TINKER_CONFIG" >/dev/null 2>&1; then
+  fail "config.json is not valid JSON. Fix it, or delete it to run Claude-only. ($TINKER_CONFIG)"
+  runner=direct
+else
+  pass "config.json is valid JSON"
+  for role in reader drafter; do
+    url=$(jq -r --arg r "$role" '.[$r].url // empty' "$TINKER_CONFIG")
+    model=$(jq -r --arg r "$role" '.[$r].model // empty' "$TINKER_CONFIG")
+    keyvar=$(jq -r --arg r "$role" '.[$r].api_key_env // empty' "$TINKER_CONFIG")
+    if [ -z "$url" ]; then
+      if [ "$role" = drafter ] && [ -n "$(jq -r '.reader.url // empty' "$TINKER_CONFIG")" ]; then
+        pass "$role: not set — drafting falls back to the reader model"
+      else
+        pass "$role: not set — Claude does this job itself"
+      fi
+      continue
+    fi
+    [ -n "$model" ] || { fail "$role: has a url but no \"model\""; continue; }
+    hdr=()
+    if [ -n "$keyvar" ]; then
+      key=${!keyvar:-}
+      if [ -z "$key" ]; then warn "$role: api_key_env is $keyvar but that variable is empty"; else hdr=(-H "Authorization: Bearer $key"); fi
+    fi
+    url=${url%/}
+    if out=$(curl -sS -m 8 ${hdr[@]+"${hdr[@]}"} "$url/models" 2>&1); then
+      if printf '%s' "$out" | jq -e --arg m "$model" '[.data[]?.id] | index($m) != null' >/dev/null 2>&1; then
+        pass "$role: $url is up and serves $model"
+      elif printf '%s' "$out" | jq -e '.data' >/dev/null 2>&1; then
+        warn "$role: $url is up but doesn't list \"$model\" (it lists: $(printf '%s' "$out" | jq -r '[.data[]?.id] | join(", ")' | cut -c1-120))"
+      else
+        warn "$role: $url answered, but not like an OpenAI-style /models endpoint"
+      fi
+    else
+      warn "$role: can't reach $url/models — is the model server running? (until then Claude does this job)"
+    fi
+  done
+  runner=$(jq -r '.runner // "direct"' "$TINKER_CONFIG")
+fi
+
+# --- runner ----------------------------------------------------------------------------------
+runner=${TINKER_RUNNER:-$runner}
+case "$runner" in
+  direct) pass "runner: direct (experiments run on this computer, in the background)" ;;
+  gpu-queue)
+    if [ -n "${TINKER_QUEUE_SUBMIT:-}" ] && [ -n "${TINKER_QUEUE_STAT:-}" ]; then
+      pass "runner: gpu-queue (submit: $TINKER_QUEUE_SUBMIT · status: $TINKER_QUEUE_STAT)"
+    else
+      warn "runner: gpu-queue, but TINKER_QUEUE_SUBMIT / TINKER_QUEUE_STAT are not set — experiments can't be queued"
+    fi ;;
+  *) if [ -x "$TINKER_HOME/runners/$runner.sh" ]; then pass "runner: $runner"
+     else fail "runner: '$runner' is unknown (use direct or gpu-queue)"; fi ;;
+esac
+
+# --- GPU (optional) --------------------------------------------------------------------------
+if command -v nvidia-smi >/dev/null 2>&1 && gpus=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null) && [ -n "$gpus" ]; then
+  pass "GPU found: $(printf '%s' "$gpus" | head -3 | tr '\n' ';' | sed 's/;$//')"
+else
+  pass "no NVIDIA GPU detected — fine; only projects that run heavy experiments need one"
+fi
+
+# --- projects dir ----------------------------------------------------------------------------
+if [ -d "$PROJECTS_DIR" ] && [ -w "$PROJECTS_DIR" ]; then pass "projects folder is writable ($PROJECTS_DIR)"
+else fail "projects folder missing or not writable: $PROJECTS_DIR"; fi
+
+echo
+if [ "$fails" -gt 0 ]; then
+  echo "Result: $fails problem(s) to fix before tinkerloop can run."; exit 1
+elif [ "$warns" -gt 0 ]; then
+  echo "Result: ready ($warns warning(s) above are optional)."
+else
+  echo "Result: ready."
+fi

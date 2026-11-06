@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# tinker-loop <project> — THE worker (blocking). Normally launched in the background by
+# `tinker start <project>`; run it directly only to watch one project's loop in the foreground.
+# Chains headless `claude -p` sessions, each doing exactly ONE move per loop/PROTOCOL.md, scoped to
+# projects/<project>/, until the project is STOPped or MAX_SESSIONS is spent. When no move is
+# eligible the session writes state/IDLE and the loop polls cheaply (no Claude usage) until a gate
+# is answered or a tracked experiment finishes. Resumable: all state is in files.
+#
+# Env knobs:
+#   MAX_SESSIONS=40          cap on counted Claude sessions this run
+#   TINKER_MODEL=<model>     judgment model (passed as --model); unset = Claude Code's default
+#   TINKER_DEVOPS_MODEL=<m>  model for cheap moves (NEXT-TIER: devops|wait, forced housekeeping);
+#                            unset = same as TINKER_MODEL
+#   SESSION_TIMEOUT=7200     hard cap per session, seconds (needs `timeout`/`gtimeout`)
+#   IDLE_POLL=300            seconds between idle checks for gate answers / finished experiments
+#   QUOTA_BACKOFF=2700       wait after a usage-limit error (not counted as a session)
+#   STATE_BUDGET=40          STATE.md line budget; over it → forced HOUSEKEEPING move
+#   TINKER_SKIP_PERMISSIONS=0  SAFE (default): sessions run with --permission-mode acceptEdits + the
+#                            allowlist in .claude/settings.json — they read, search, write inside this
+#                            folder, and run NO code; experiments wait for your "run" on a run-gate.
+#                            1 = FULL AUTONOMY: --dangerously-skip-permissions (any command, unsupervised).
+set -euo pipefail
+_s=${BASH_SOURCE[0]}
+while [ -L "$_s" ]; do _t=$(readlink "$_s"); case "$_t" in /*) _s=$_t ;; *) _s=$(dirname "$_s")/$_t ;; esac; done
+TL_SELF=$_s
+# shellcheck source=bin/_common.sh
+. "$(cd "$(dirname "$_s")" && pwd -P)/../bin/_common.sh"
+
+P=${1:?usage: tinker-loop <project>}
+tl_valid_slug "$P" || { echo "tinker-loop: invalid project name: $P"; exit 2; }
+PDIR=$PROJECTS_DIR/$P
+[ -d "$PDIR" ] || { echo "tinker-loop: no such project: $P (looked in $PDIR)"; exit 2; }
+
+LOGS=$PDIR/logs; STATE=$PDIR/state; GATES=$PDIR/gates; mkdir -p "$LOGS" "$STATE" "$GATES"
+MAX_SESSIONS=${MAX_SESSIONS:-40}
+SESSION_TIMEOUT=${SESSION_TIMEOUT:-7200}
+IDLE_POLL=${IDLE_POLL:-300}
+QUOTA_BACKOFF=${QUOTA_BACKOFF:-2700}
+STATE_BUDGET=${STATE_BUDGET:-40}
+TINKER_MODEL=${TINKER_MODEL:-}
+TINKER_DEVOPS_MODEL=${TINKER_DEVOPS_MODEL:-$TINKER_MODEL}
+TINKER_SKIP_PERMISSIONS=${TINKER_SKIP_PERMISSIONS:-0}
+if [ "$TINKER_SKIP_PERMISSIONS" = 1 ]; then PERM_MODE=full; else PERM_MODE=safe; fi
+
+command -v claude >/dev/null 2>&1 || { echo "tinker-loop: 'claude' not found on PATH — run 'tinker doctor'"; exit 1; }
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
+else echo "tinker-loop: note — no 'timeout' command; sessions run without the ${SESSION_TIMEOUT}s cap"; fi
+
+# single-loop-per-project guard + pid file (tinker start/status/stop read this)
+PIDF=$STATE/loop.pid
+if opid=$(tl_pid_alive "$PIDF") && [ "$opid" != "$$" ]; then
+  echo "tinker-loop: $P already has a live loop (pid $opid) — refusing to double-run."; exit 3
+fi
+echo $$ > "$PIDF"
+cleanup() { if [ "$(cat "$PIDF" 2>/dev/null)" = "$$" ]; then rm -f "$PIDF"; fi; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+cd "$TINKER_HOME"; rm -f "$STATE/STOP"
+export TINKER_PROJECT=$P
+echo "[$P] start $(date '+%F %T') cap=$MAX_SESSIONS model=${TINKER_MODEL:-default} permissions=$PERM_MODE pid=$$"
+
+# --- experiment lifecycle: has a tracked job finished without the loop noticing yet? ---
+# STATE.md lists jobs in its `## Experiments` block as lines containing `job=<JOB_ID>` and a recorded
+# `status=<pending|running|done|failed>`. `bin/tinker-run status` reports the TRUE status (exit:
+# 0 done · 1 failed · 2 running · 3 pending · 4 missing). Wake only on an UNHANDLED completion — the
+# runner says terminal but STATE still records non-terminal — so a session that already reconciled
+# (wrote status=done/failed) does not cause an endless re-arm.
+experiment_finished() {
+  local line jid rec st
+  [ -f "$PDIR/STATE.md" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in *job=*) ;; *) continue ;; esac
+    jid=$(printf '%s' "$line" | sed -n 's/.*job=\([A-Za-z0-9._-]*\).*/\1/p')
+    [ -n "$jid" ] || continue
+    rec=$(printf '%s' "$line" | sed -n 's/.*status=\([a-z]*\).*/\1/p')
+    case "$rec" in done|failed|missing|settled) continue ;; esac
+    st=0; "$TINKER_HOME/bin/tinker-run" status "$jid" >/dev/null 2>&1 || st=$?
+    case "$st" in 0|1|4) return 0 ;; esac
+  done < "$PDIR/STATE.md"
+  return 1
+}
+
+# a gate answer written after the loop went idle (and with real content, not just the placeholder)
+gate_answered_since_idle() {
+  local f
+  for f in "$GATES"/*.answer.md; do
+    [ -f "$f" ] || continue
+    [ "$f" -nt "$STATE/IDLE" ] || continue
+    tl_gate_answered "$f" && return 0
+  done
+  return 1
+}
+
+# sleep in short slices so `tinker stop` takes effect promptly even while idle
+nap() {
+  local left=$1 step
+  while [ "$left" -gt 0 ]; do
+    [ -e "$STATE/STOP" ] && return 0
+    step=5; [ "$left" -lt 5 ] && step=$left
+    sleep "$step"; left=$((left-step))
+  done
+}
+
+run_claude() {  # run_claude <model-or-empty> <prompt> <log>
+  local model=$1 prompt=$2 log=$3
+  set -- -p "$prompt"
+  [ -n "$model" ] && set -- "$@" --model "$model"
+  if [ "$PERM_MODE" = full ]; then set -- "$@" --dangerously-skip-permissions
+  else set -- "$@" --permission-mode acceptEdits; fi
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$SESSION_TIMEOUT" claude "$@" >"$log" 2>&1 </dev/null
+  else
+    claude "$@" >"$log" 2>&1 </dev/null
+  fi
+}
+
+# --- run-approval gates: gates/<id>.run (written by bin/gate.sh --run) + an answer. -------------
+# First word run|yes|approve → verify the fingerprint recorded OUTSIDE the repo at gate time (the
+# command and the files in its folder are unchanged), submit via bin/tinker-run, write gates/<id>.job.
+# Anything else → gates/<id>.declined. Either way the gate answer re-arms an idle loop so the next
+# session reads the outcome. A gate without a .run spec is never executed, whatever its answer says.
+process_run_gates() {
+  local spec id ans word rec fp jid
+  for spec in "$GATES"/*.run; do
+    [ -f "$spec" ] || continue
+    id=$(basename "$spec" .run)
+    [ -e "$GATES/$id.job" ] || [ -e "$GATES/$id.declined" ] && continue
+    ans=$GATES/$id.answer.md
+    tl_gate_answered "$ans" || continue
+    word=$(sed -e 's/<!--.*-->//g' "$ans" | tr -s '[:space:]' '\n' | grep -m1 . | tr '[:upper:]' '[:lower:]' | tr -cd '[:lower:]')
+    case "$word" in
+      run|yes|approve|approved) ;;
+      *) echo "declined by user (answer: $word)" > "$GATES/$id.declined"
+         echo "[$P] run-gate $id declined — not executed"; continue ;;
+    esac
+    rec=$(tl_run_record "$P" "$id")
+    fp=$(tl_run_fingerprint "$spec" 2>/dev/null || echo none)
+    if [ ! -f "$rec" ] || [ "$(cat "$rec")" != "$fp" ]; then
+      echo "refused: the command or its folder changed after the gate was raised (or no record) — re-gate" > "$GATES/$id.declined"
+      echo "[$P] run-gate $id REFUSED — fingerprint mismatch, not executed"; continue
+    fi
+    if jid=$("$TINKER_HOME/bin/tinker-run" submit --project "$P" --name "$id" \
+          --vram "$(jq -r '.vram // 0' "$spec")" --class "$(jq -r '.class // "default"' "$spec")" \
+          --cwd "$(jq -r '.cwd' "$spec")" --cmd "$(jq -r '.cmd' "$spec")"); then
+      printf '%s\n' "$jid" > "$GATES/$id.job"
+      echo "[$P] run-gate $id approved — submitted job=$jid"
+    else
+      echo "submit failed — see runner.log" > "$GATES/$id.declined"
+      echo "[$P] run-gate $id approved but submit FAILED"
+    fi
+  done
+}
+
+i=0
+while [ "$i" -lt "$MAX_SESSIONS" ]; do
+  [ -e "$STATE/STOP" ] && { echo "[$P] STOP — exiting"; break; }
+
+  # Approved run-gates are executed HERE, by this bash driver — never by Claude.
+  process_run_gates || true
+
+  # Idle = the last session found no eligible move. Two things end idleness: a gate answer, or a
+  # tracked experiment finishing. Polling here costs sleeps, not Claude sessions.
+  if [ -e "$STATE/IDLE" ]; then
+    if gate_answered_since_idle; then
+      echo "[$P] gate answered — re-arming"; rm -f "$STATE/IDLE"
+    elif experiment_finished; then
+      echo "[$P] tracked experiment finished — re-arming"; rm -f "$STATE/IDLE"
+    else
+      nap "$IDLE_POLL"; continue
+    fi
+  fi
+
+  i=$((i+1)); TS=$(date '+%Y%m%d-%H%M%S'); LOG="$LOGS/session-$TS-$i.log"
+
+  # Model tier for THIS move: judgment by default. A session may leave `NEXT-TIER: devops|wait` in
+  # STATE for a cheap, non-judgment move. Unknown/absent → judgment (the safe default).
+  MODEL=$TINKER_MODEL
+  case "$(grep -m1 '^NEXT-TIER:' "$PDIR/STATE.md" 2>/dev/null | awk '{print $2}')" in
+    devops|wait) MODEL=$TINKER_DEVOPS_MODEL ;;
+  esac
+
+  # STATE budget: if STATE.md is over budget, FORCE this move to compaction on the cheaper tier.
+  PROMPT="Active project: $P. Run exactly ONE move now, following loop/PROTOCOL.md. Read projects/$P/STATE.md first."
+  if [ "$PERM_MODE" = safe ]; then
+    PROMPT="$PROMPT  Permission mode: SAFE — you may not run code; request experiment runs via run-gates (bin/gate.sh ... --run), and if any tool call is denied, do not work around it: raise a gate and exit."
+  else
+    PROMPT="$PROMPT  Permission mode: FULL AUTONOMY — you may run experiments yourself via bin/tinker-run submit."
+  fi
+  SLINES=$(wc -l < "$PDIR/STATE.md" 2>/dev/null | tr -d ' ' || echo 0)
+  if [ "${SLINES:-0}" -gt "$STATE_BUDGET" ]; then
+    MODEL=$TINKER_DEVOPS_MODEL
+    PROMPT="$PROMPT  OVERRIDE: STATE.md is $SLINES lines, over the $STATE_BUDGET-line budget. Your ONE move this session is HOUSEKEEPING ONLY: compact STATE.md well under budget per loop/PROTOCOL.md (collapse resolved sagas to one-line pointers; push proven constraints to SEED's ledger). Do nothing else."
+  fi
+
+  echo "[$P] session $i/$MAX_SESSIONS → $LOG (model=${MODEL:-default}, permissions=$PERM_MODE)"
+  rc=0; run_claude "$MODEL" "$PROMPT" "$LOG" || rc=$?
+  echo "[$P] session $i exit=$rc :: $(tail -c 400 "$LOG" | tr '\n' ' ')"
+  if [ "$rc" -ne 0 ]; then
+    # A usage-limit hit isn't a spent session: don't count it, wait out the window.
+    if tail -c 2000 "$LOG" | grep -qiE 'usage limit|rate.?limit|out of usage|quota'; then
+      i=$((i-1)); echo "[$P] usage limit — backing off ${QUOTA_BACKOFF}s (not counted)"
+      nap "$QUOTA_BACKOFF"; continue
+    fi
+    nap 60   # API hiccup / timeout: brief backoff; file state self-heals
+  fi
+done
+[ "$i" -ge "$MAX_SESSIONS" ] && echo "[$P] reached MAX_SESSIONS=$MAX_SESSIONS — run 'tinker start $P' to continue"
+echo "[$P] done $(date '+%F %T')"
